@@ -308,7 +308,7 @@ func sync(table *route.Table, peerName string, privateKey wgtypes.Key, iface int
 			nodeNames = append(nodeNames, n.Name)
 		}
 		if n.WireGuardIP != nil && subnet == nil {
-			subnet = n.WireGuardIP
+			subnet = &net.IPNet{IP: n.WireGuardIP.IP.Mask(n.WireGuardIP.Mask), Mask: n.WireGuardIP.Mask}
 		}
 	}
 	if len(nodes) == 0 {
@@ -317,7 +317,6 @@ func sync(table *route.Table, peerName string, privateKey wgtypes.Key, iface int
 	if subnet == nil {
 		return errors.New("did not find a valid Kilo subnet on any node")
 	}
-	subnet.IP = subnet.IP.Mask(subnet.Mask)
 	sort.Strings(nodeNames)
 	nodes[nodeNames[0]].AllowedLocationIPs = append(nodes[nodeNames[0]].AllowedLocationIPs, connectOpts.allowedIPs...)
 	peers := make(map[string]*mesh.Peer)

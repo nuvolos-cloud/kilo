@@ -16,6 +16,7 @@ package iptables
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -118,21 +119,23 @@ func (f *fakeClient) List(table, chain string) ([]string, error) {
 
 func (f *fakeClient) ClearChain(table, name string) error {
 	atomic.AddUint64(&f.calls, 1)
-	for i := range f.storage {
-		r, ok := f.storage[i].(*rule)
-		if !ok {
+	f.flushChainRules(table, name)
+	_ = f.DeleteChain(table, name)
+	return f.NewChain(table, name)
+}
+
+func (f *fakeClient) flushChainRules(table, name string) {
+	kept := f.storage[:0]
+	for _, item := range f.storage {
+		if r, ok := item.(*rule); ok && r.table == table && r.chain == name {
 			continue
 		}
-		if table == r.table && name == r.chain {
-			if err := f.Delete(table, name, r.spec...); err != nil {
-				return nil
-			}
-		}
+		kept = append(kept, item)
 	}
-	if err := f.DeleteChain(table, name); err != nil {
-		return err
+	for i := len(kept); i < len(f.storage); i++ {
+		f.storage[i] = nil
 	}
-	return f.NewChain(table, name)
+	f.storage = kept
 }
 
 func (f *fakeClient) DeleteChain(table, name string) error {
@@ -182,4 +185,127 @@ func (f *fakeClient) ListChains(table string) ([]string, error) {
 		}
 	}
 	return cs, nil
+}
+
+func (f *fakeClient) RestoreNoFlush(input string) error {
+	if input == "" {
+		return nil
+	}
+	atomic.AddUint64(&f.calls, 1)
+	var table string
+	for _, rawLine := range strings.Split(input, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || line == "COMMIT" {
+			continue
+		}
+		if strings.HasPrefix(line, "*") {
+			table = line[1:]
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			fields := strings.Fields(line[1:])
+			if len(fields) == 0 {
+				continue
+			}
+			chName := fields[0]
+			f.flushChainRules(table, chName)
+			exists := false
+			c := &chain{table: table, chain: chName}
+			for _, item := range f.storage {
+				if item.String() == c.String() {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				f.storage = append(f.storage, c)
+			}
+			continue
+		}
+		tokens := splitRestoreArgs(line)
+		if len(tokens) < 2 {
+			continue
+		}
+		switch tokens[0] {
+		case "-A":
+			f.storage = append(f.storage, &rule{table: table, chain: tokens[1], spec: tokens[2:]})
+		case "-I":
+			pos := 1
+			specStart := 2
+			if len(tokens) >= 3 {
+				if p, err := strconv.Atoi(tokens[2]); err == nil {
+					pos = p
+					specStart = 3
+				}
+			}
+			idx := pos - 1
+			if idx < 0 {
+				idx = 0
+			}
+			if idx > len(f.storage) {
+				idx = len(f.storage)
+			}
+			r := &rule{table: table, chain: tokens[1], spec: tokens[specStart:]}
+			f.storage = append(f.storage, nil)
+			copy(f.storage[idx+1:], f.storage[idx:])
+			f.storage[idx] = r
+		case "-D":
+			r := &rule{table: table, chain: tokens[1], spec: tokens[2:]}
+			found := false
+			for i := range f.storage {
+				if f.storage[i].String() == r.String() {
+					copy(f.storage[i:], f.storage[i+1:])
+					f.storage[len(f.storage)-1] = nil
+					f.storage = f.storage[:len(f.storage)-1]
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("bad rule (does a matching rule exist in chain %s?): %s", tokens[1], r.String())
+			}
+		case "-F":
+			f.flushChainRules(table, tokens[1])
+		case "-X":
+			for i := range f.storage {
+				if r, ok := f.storage[i].(*rule); ok && r.table == table && r.chain == tokens[1] {
+					return fmt.Errorf("cannot delete chain %s; rules exist", tokens[1])
+				}
+			}
+			c := &chain{table: table, chain: tokens[1]}
+			for i := range f.storage {
+				if f.storage[i].String() == c.String() {
+					copy(f.storage[i:], f.storage[i+1:])
+					f.storage[len(f.storage)-1] = nil
+					f.storage = f.storage[:len(f.storage)-1]
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func splitRestoreArgs(line string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuotes := false
+	for i := range len(line) {
+		ch := line[i]
+		switch {
+		case ch == '"':
+			inQuotes = !inQuotes
+		case (ch == ' ' || ch == '\t') && !inQuotes:
+			if cur.Len() > 0 {
+				args = append(args, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	if cur.Len() > 0 {
+		args = append(args, cur.String())
+	}
+	return args
 }

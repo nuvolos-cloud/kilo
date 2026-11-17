@@ -162,10 +162,10 @@ func runShowConfNode(_ *cobra.Command, args []string) error {
 			nodes[n.Name] = n
 		}
 		if n.WireGuardIP != nil {
-			subnet = n.WireGuardIP
+			subnet = &net.IPNet{IP: n.WireGuardIP.IP.Mask(n.WireGuardIP.Mask), Mask: n.WireGuardIP.Mask}
 		}
 	}
-	subnet.IP = subnet.IP.Mask(subnet.Mask)
+	subnet = &net.IPNet{IP: subnet.IP.Mask(subnet.Mask), Mask: subnet.Mask}
 	if len(nodes) == 0 {
 		return errors.New("did not find any valid Kilo nodes in the cluster")
 	}
@@ -260,10 +260,10 @@ func runShowConfPeer(_ *cobra.Command, args []string) error {
 			hostname = n.Name
 		}
 		if n.WireGuardIP != nil {
-			subnet = n.WireGuardIP
+			subnet = &net.IPNet{IP: n.WireGuardIP.IP.Mask(n.WireGuardIP.Mask), Mask: n.WireGuardIP.Mask}
 		}
 	}
-	subnet.IP = subnet.IP.Mask(subnet.Mask)
+	subnet = &net.IPNet{IP: subnet.IP.Mask(subnet.Mask), Mask: subnet.Mask}
 	if len(nodes) == 0 {
 		return errors.New("did not find any valid Kilo nodes in the cluster")
 	}

@@ -394,6 +394,11 @@ func (t *Topology) Rules(cni, iptablesForwardRule bool) iptables.RuleSet {
 			rules.AddToPrepend(iptables.NewRule(iptables.GetProtocol(t.subnet.IP), "filter", "FORWARD", "-m", "comment", "--comment", "Kilo: forward packets to the node's pod subnet", "-d", t.subnet.String(), "-j", "ACCEPT"))
 		}
 	}
+	// KILO-NAT is only reachable through POSTROUTING jumps. Without any jump,
+	// its rules are dead weight and every change costs iptables invocations.
+	if !t.natJumps(cni) {
+		return rules
+	}
 	for _, s := range t.segments {
 		rules.AddToPrepend(iptables.NewRule(iptables.GetProtocol(s.wireGuardIP), "nat", "KILO-NAT", "-d", oneAddressCIDR(s.wireGuardIP).String(), "-m", "comment", "--comment", "Kilo: do not NAT packets destined for WireGuared IPs", "-j", "RETURN"))
 		for _, aip := range s.allowedIPs {
@@ -404,7 +409,7 @@ func (t *Topology) Rules(cni, iptablesForwardRule bool) iptables.RuleSet {
 		// We only want to NAT in locations of the corresponding allowed location IPs.
 		if t.location == s.location {
 			for _, alip := range s.allowedLocationIPs {
-				rules.AddToPrepend(iptables.NewRule(iptables.GetProtocol(alip.IP), "nat", "POSTROUTING", "-d", alip.String(), "!", "-s", alip.String(), "-m", "comment", "--comment", "Kilo: jump to NAT chain", "-j", "KILO-NAT"))
+				rules.AddToPrepend(iptables.NewRule(iptables.GetProtocol(alip.IP), "nat", "POSTROUTING", "!", "-s", alip.String(), "-d", alip.String(), "-m", "comment", "--comment", "Kilo: jump to NAT chain", "-j", "KILO-NAT"))
 			}
 		}
 	}
@@ -420,6 +425,24 @@ func (t *Topology) Rules(cni, iptablesForwardRule bool) iptables.RuleSet {
 	rules.AddToAppend(iptables.NewIPv4Rule("nat", "KILO-NAT", "-m", "comment", "--comment", "Kilo: NAT remaining packets", "-j", "MASQUERADE"))
 	rules.AddToAppend(iptables.NewIPv6Rule("nat", "KILO-NAT", "-m", "comment", "--comment", "Kilo: NAT remaining packets", "-j", "MASQUERADE"))
 	return rules
+}
+
+// natJumps reports whether any POSTROUTING rule jumps to KILO-NAT.
+func (t *Topology) natJumps(cni bool) bool {
+	if cni {
+		return true
+	}
+	for _, s := range t.segments {
+		if t.location == s.location && len(s.allowedLocationIPs) > 0 {
+			return true
+		}
+	}
+	for _, p := range t.peers {
+		if len(p.AllowedIPs) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultRule(rule *netlink.Rule) *netlink.Rule {

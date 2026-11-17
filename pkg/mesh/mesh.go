@@ -45,6 +45,8 @@ const (
 	kiloPath = "/var/lib/kilo"
 	// privateKeyPath is the filepath where the WireGuard private key is stored.
 	privateKeyPath = kiloPath + "/key"
+	// nodeDebounce is how long node events are coalesced before the topology is rebuilt.
+	nodeDebounce = time.Second
 )
 
 // Mesh is able to create Kilo network meshes.
@@ -280,12 +282,25 @@ func (m *Mesh) Run(ctx context.Context) error {
 	pw := m.Peers().Watch()
 	var ne *NodeEvent
 	var pe *PeerEvent
+	// nodeFlush fires once per debounce window to rebuild the topology
+	// after node events; nil when no rebuild is pending.
+	var nodeFlush <-chan time.Time
 	for {
 		select {
 		case ne = <-nw:
-			m.syncNodes(ctx, ne)
+			applied, changed := m.syncNodes(ctx, ne)
+			if applied {
+				nodeFlush = nil
+			} else if changed && nodeFlush == nil {
+				nodeFlush = time.After(nodeDebounce)
+			}
+		case <-nodeFlush:
+			nodeFlush = nil
+			m.applyTopology()
 		case pe = <-pw:
-			m.syncPeers(pe)
+			if m.syncPeers(pe) {
+				nodeFlush = nil
+			}
 		case <-checkIn.C:
 			m.checkIn(ctx)
 			checkIn.Reset(checkInPeriod)
@@ -293,6 +308,7 @@ func (m *Mesh) Run(ctx context.Context) error {
 			if m.cni {
 				m.updateCNIConfig()
 			}
+			nodeFlush = nil
 			m.applyTopology()
 			resync.Reset(m.resyncPeriod)
 		case <-ctx.Done():
@@ -301,15 +317,13 @@ func (m *Mesh) Run(ctx context.Context) error {
 	}
 }
 
-func (m *Mesh) syncNodes(ctx context.Context, e *NodeEvent) {
+func (m *Mesh) syncNodes(ctx context.Context, e *NodeEvent) (applied bool, diff bool) {
 	logger := log.With(m.logger, "event", e.Type)
 	_ = level.Debug(logger).Log("msg", "syncing nodes", "event", e.Type)
 	if isSelf(m.hostname, e.Node) {
 		_ = level.Debug(logger).Log("msg", "processing local node", "node", e.Node)
-		m.handleLocal(ctx, e.Node)
-		return
+		return m.handleLocal(ctx, e.Node), false
 	}
-	var diff bool
 	m.mu.Lock()
 	if !e.Node.Ready() {
 		// Trace non ready nodes with their presence in the mesh.
@@ -320,7 +334,7 @@ func (m *Mesh) syncNodes(ctx context.Context, e *NodeEvent) {
 	case AddEvent:
 		fallthrough
 	case UpdateEvent:
-		if !nodesAreEqual(m.nodes[e.Node.Name], e.Node) {
+		if !m.remoteNodesAreEqual(m.nodes[e.Node.Name], e.Node) {
 			diff = true
 		}
 		// Even if the nodes are the same,
@@ -333,11 +347,11 @@ func (m *Mesh) syncNodes(ctx context.Context, e *NodeEvent) {
 	m.mu.Unlock()
 	if diff {
 		_ = level.Info(logger).Log("node", e.Node)
-		m.applyTopology()
 	}
+	return false, diff
 }
 
-func (m *Mesh) syncPeers(e *PeerEvent) {
+func (m *Mesh) syncPeers(e *PeerEvent) bool {
 	logger := log.With(m.logger, "event", e.Type)
 	_ = level.Debug(logger).Log("msg", "syncing peers", "event", e.Type)
 	var diff bool
@@ -370,6 +384,7 @@ func (m *Mesh) syncPeers(e *PeerEvent) {
 		_ = level.Info(logger).Log("peer", e.Peer)
 		m.applyTopology()
 	}
+	return diff
 }
 
 // checkIn will try to update the local node's LastSeen timestamp
@@ -394,8 +409,7 @@ func (m *Mesh) checkIn(ctx context.Context) {
 	_ = level.Debug(m.logger).Log("msg", "successfully checked in local node in backend")
 }
 
-func (m *Mesh) handleLocal(ctx context.Context, n *Node) {
-	// Allow the IPs to be overridden.
+func (m *Mesh) handleLocal(ctx context.Context, n *Node) bool {
 	if !n.Endpoint.Ready() {
 		e := wireguard.NewEndpoint(m.externalIP.IP, m.port)
 		_ = level.Info(m.logger).Log("msg", "overriding endpoint", "node", m.hostname, "old endpoint", n.Endpoint.String(), "new endpoint", e.String())
@@ -403,6 +417,10 @@ func (m *Mesh) handleLocal(ctx context.Context, n *Node) {
 	}
 	if n.InternalIP == nil && !n.NoInternalIP {
 		n.InternalIP = m.internalIP
+	}
+	wireGuardIP := m.wireGuardIP
+	if wireGuardIP == nil && n.WireGuardIP != nil && m.subnet != nil && m.subnet.Contains(n.WireGuardIP.IP) && subnetsEqual(m.subnet, n.WireGuardIP) {
+		wireGuardIP = n.WireGuardIP
 	}
 	// Compare the given node to the calculated local node.
 	// Take leader, location, and subnet from the argument, as these
@@ -419,7 +437,7 @@ func (m *Mesh) handleLocal(ctx context.Context, n *Node) {
 		Name:                m.hostname,
 		PersistentKeepalive: n.PersistentKeepalive,
 		Subnet:              n.Subnet,
-		WireGuardIP:         m.wireGuardIP,
+		WireGuardIP:         wireGuardIP,
 		DiscoveredEndpoints: n.DiscoveredEndpoints,
 		AllowedLocationIPs:  n.AllowedLocationIPs,
 		Granularity:         m.granularity,
@@ -429,7 +447,7 @@ func (m *Mesh) handleLocal(ctx context.Context, n *Node) {
 		if err := m.Nodes().Set(ctx, m.hostname, local); err != nil {
 			_ = level.Error(m.logger).Log("error", fmt.Sprintf("failed to set local node: %v", err), "node", local)
 			m.errorCounter.WithLabelValues("local").Inc()
-			return
+			return false
 		}
 		_ = level.Debug(m.logger).Log("msg", "successfully reconciled local node against backend")
 	}
@@ -445,7 +463,9 @@ func (m *Mesh) handleLocal(ctx context.Context, n *Node) {
 		m.nodes[local.Name] = local
 		m.mu.Unlock()
 		m.applyTopology()
+		return true
 	}
+	return false
 }
 
 func (m *Mesh) applyTopology() {
@@ -529,11 +549,23 @@ func (m *Mesh) applyTopology() {
 		m.errorCounter.WithLabelValues("apply").Inc()
 		return
 	}
-	// Update the node's WireGuard IP.
+	// Update the node's WireGuard IP and publish it immediately if changed so
+	// remote nodes observe this leader's claimed IP without waiting for checkIn.
+	var newWireGuardIP *net.IPNet
 	if t.leader {
-		m.wireGuardIP = t.wireGuardCIDR
-	} else {
-		m.wireGuardIP = nil
+		newWireGuardIP = t.wireGuardCIDR
+	}
+	m.wireGuardIP = newWireGuardIP
+	if !ipNetsEqual(nodes[m.hostname].WireGuardIP, newWireGuardIP) {
+		prevWireGuardIP := nodes[m.hostname].WireGuardIP
+		nodes[m.hostname].WireGuardIP = newWireGuardIP
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := m.Nodes().Set(ctx, m.hostname, nodes[m.hostname]); err != nil {
+			_ = level.Error(m.logger).Log("error", fmt.Sprintf("failed to set local node WireGuard IP: %v", err), "node", nodes[m.hostname])
+			m.errorCounter.WithLabelValues("apply").Inc()
+			nodes[m.hostname].WireGuardIP = prevWireGuardIP
+		}
+		cancel()
 	}
 	ipRules := t.Rules(m.cni, m.iptablesForwardRule)
 
@@ -712,6 +744,98 @@ func nodesAreEqual(a, b *Node) bool {
 		a.Granularity == b.Granularity
 }
 
+// remoteNodesAreEqual compares a cached remote node against a newly received version,
+// ignoring DiscoveredEndpoints keys that cannot affect any WireGuard peer endpoint on
+// the local node. Caller must hold m.mu.
+func (m *Mesh) remoteNodesAreEqual(a, b *Node) bool {
+	if (a != nil) != (b != nil) {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if !a.Endpoint.Equal(b.Endpoint, true) {
+		return false
+	}
+	if !(a.Key.String() == b.Key.String() &&
+		ipNetsEqual(a.WireGuardIP, b.WireGuardIP) &&
+		ipNetsEqual(a.InternalIP, b.InternalIP) &&
+		ipNetsEqual(a.CNICompatibilityIP, b.CNICompatibilityIP) &&
+		a.Leader == b.Leader &&
+		a.Location == b.Location &&
+		a.Name == b.Name &&
+		subnetsEqual(a.Subnet, b.Subnet) &&
+		a.Ready() == b.Ready() &&
+		a.PersistentKeepalive == b.PersistentKeepalive &&
+		ipNetSlicesEqual(a.AllowedLocationIPs, b.AllowedLocationIPs) &&
+		a.Granularity == b.Granularity) {
+		return false
+	}
+	return relevantDiscoveredEndpointsEqual(a.DiscoveredEndpoints, b.DiscoveredEndpoints, m.isRelevantDiscoveredEndpointKey)
+}
+
+// isRelevantDiscoveredEndpointKey reports whether a DiscoveredEndpoints entry for key
+// can affect the local node's WireGuard or route configuration. Caller must hold m.mu.
+func (m *Mesh) isRelevantDiscoveredEndpointKey(key string) bool {
+	local := m.nodes[m.hostname]
+	if local != nil && local.DiscoveredEndpoints != nil {
+		// Local node's own discovered endpoint takes precedence in NewTopology.
+		if _, ok := local.DiscoveredEndpoints[key]; ok {
+			return false
+		}
+	}
+	for _, n := range m.nodes {
+		if n == nil || n.Key.String() != key {
+			continue
+		}
+		// updateEndpoint ignores discovered endpoints when PersistentKeepalive == 0.
+		if n.PersistentKeepalive == 0 {
+			return false
+		}
+		if local != nil {
+			if n.Name == m.hostname {
+				return false
+			}
+			// In cross granularity, nodes in the same location never peer over WireGuard.
+			if m.granularity == CrossGranularity && n.Location == local.Location {
+				return false
+			}
+		}
+		return true
+	}
+	for _, p := range m.peers {
+		if p == nil || p.PublicKey.String() != key {
+			continue
+		}
+		return p.PersistentKeepaliveInterval != nil && *p.PersistentKeepaliveInterval != 0
+	}
+	return false
+}
+
+func relevantDiscoveredEndpointsEqual(a, b map[string]*net.UDPAddr, relevant func(string) bool) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	for k, va := range a {
+		if !relevant(k) {
+			continue
+		}
+		if !udpAddrsEqual(va, b[k]) {
+			return false
+		}
+	}
+	for k, vb := range b {
+		if !relevant(k) {
+			continue
+		}
+		if _, seen := a[k]; !seen {
+			if !udpAddrsEqual(nil, vb) {
+				return false
+			}
+		}
+	}
+	return true
+}
 func peersAreEqual(a, b *Peer) bool {
 	if (a != nil) != (b != nil) {
 		return false

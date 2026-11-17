@@ -241,16 +241,41 @@ func NewTopology(nodes map[string]*Node, peers map[string]*Peer, granularity Gra
 		t.discoveredEndpoints[key] = nodes[hostname].DiscoveredEndpoints[key]
 	}
 	// Allocate IPs to the segment leaders in a stable, coordination-free manner.
-	a := newAllocator(*subnet)
+	// Preserve any valid, non-colliding WireGuard IP already published by a segment's
+	// leader so newly joining or leaving nodes never renumber existing peers.
+	baseNet := net.IPNet{IP: subnet.IP.Mask(subnet.Mask), Mask: subnet.Mask}
+	claimedIPs := make(map[string]struct{}, len(t.segments))
 	for _, segment := range t.segments {
-		ipNet := a.next()
-		if ipNet == nil {
-			return nil, errors.New("failed to allocate an IP address; ran out of IP addresses")
+		segNodes := topoMap[topoKey{location: segment.location, nodeLocation: segment.nodeLocation}]
+		leaderNode := segNodes[segment.leader]
+		if validClaimedWireGuardIP(leaderNode.WireGuardIP, baseNet) {
+			ip := canonicalIP(leaderNode.WireGuardIP.IP)
+			key := ip.String()
+			if _, taken := claimedIPs[key]; !taken {
+				claimedIPs[key] = struct{}{}
+				segment.wireGuardIP = ip
+			}
 		}
-		segment.wireGuardIP = ipNet.IP
-		segment.allowedIPs = append(segment.allowedIPs, *oneAddressCIDR(ipNet.IP))
+	}
+	a := newAllocator(baseNet)
+	for _, segment := range t.segments {
+		if segment.wireGuardIP == nil {
+			for {
+				ipNet := a.next()
+				if ipNet == nil {
+					return nil, errors.New("failed to allocate an IP address; ran out of IP addresses")
+				}
+				key := ipNet.IP.String()
+				if _, taken := claimedIPs[key]; !taken {
+					claimedIPs[key] = struct{}{}
+					segment.wireGuardIP = ipNet.IP
+					break
+				}
+			}
+		}
+		segment.allowedIPs = append(segment.allowedIPs, *oneAddressCIDR(segment.wireGuardIP))
 		if t.leader && segment.location == t.location {
-			t.wireGuardCIDR = &net.IPNet{IP: ipNet.IP, Mask: subnet.Mask}
+			t.wireGuardCIDR = &net.IPNet{IP: segment.wireGuardIP, Mask: subnet.Mask}
 		}
 
 		// Now that the topology is ordered, update the discoveredEndpoints map
@@ -262,7 +287,9 @@ func NewTopology(nodes map[string]*Node, peers map[string]*Peer, granularity Gra
 				}
 			}
 		}
-		// Check for intersecting IPs in allowed location IPs
+	}
+	// Check for intersecting IPs in allowed location IPs after all segment WireGuard IPs are assigned.
+	for _, segment := range t.segments {
 		segment.allowedLocationIPs = t.filterAllowedLocationIPs(segment.allowedLocationIPs, segment.location)
 	}
 
@@ -499,4 +526,31 @@ func deduplicatePeerIPs(peers []*Peer) []*Peer {
 		ps[i] = &p
 	}
 	return ps
+}
+
+func canonicalIP(ip net.IP) net.IP {
+	if ip4 := ip.To4(); ip4 != nil {
+		out := make(net.IP, len(ip4))
+		copy(out, ip4)
+		return out
+	}
+	out := make(net.IP, len(ip))
+	copy(out, ip)
+	return out
+}
+
+func validClaimedWireGuardIP(wg *net.IPNet, subnet net.IPNet) bool {
+	if wg == nil || wg.IP == nil {
+		return false
+	}
+	ip := canonicalIP(wg.IP)
+	netIP := canonicalIP(subnet.IP.Mask(subnet.Mask))
+	if len(ip) != len(netIP) {
+		return false
+	}
+	if !subnet.Contains(ip) {
+		return false
+	}
+	// Reject the 0th network address, which allocator.next() never hands out.
+	return !ip.Equal(netIP)
 }

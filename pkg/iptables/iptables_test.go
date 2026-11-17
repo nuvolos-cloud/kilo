@@ -15,6 +15,10 @@
 package iptables
 
 import (
+	"fmt"
+	"os/exec"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -236,5 +240,127 @@ func TestReconcile(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestBatchRestoreKiloNAT(t *testing.T) {
+	v4 := &fakeClient{}
+	v6 := &fakeClient{}
+	controller, err := New(WithClients(v4, v6))
+	if err != nil {
+		t.Fatalf("unexpected error instantiating controller: %v", err)
+	}
+
+	// Pre-populate an unrelated external POSTROUTING rule that must never be flushed.
+	externalRule := NewIPv4Rule("nat", "POSTROUTING", "-s", "172.17.0.0/16", "-j", "MASQUERADE")
+	if err := externalRule.Append(v4); err != nil {
+		t.Fatalf("failed to seed external rule: %v", err)
+	}
+
+	buildNatSet := func(nodeCount int) RuleSet {
+		rs := RuleSet{}
+		rs.AddToAppend(NewIPv4Chain("nat", "KILO-NAT"))
+		rs.AddToPrepend(NewIPv4Rule("nat", "POSTROUTING", "!", "-s", "192.168.102.0/23", "-d", "192.168.102.0/23", "-m", "comment", "--comment", "Kilo: jump to NAT chain", "-j", "KILO-NAT"))
+		for i := range nodeCount {
+			hi := i / 256
+			lo := i % 256
+			rs.AddToPrepend(NewIPv4Rule("nat", "KILO-NAT", "-d", fmt.Sprintf("100.66.%d.%d/32", hi, lo), "-m", "comment", "--comment", "Kilo: do not NAT packets destined for WireGuared IPs", "-j", "RETURN"))
+			rs.AddToPrepend(NewIPv4Rule("nat", "KILO-NAT", "-d", fmt.Sprintf("10.246.%d.0/24", i%256), "-m", "comment", "--comment", "Kilo: do not NAT packets destined for known IPs", "-j", "RETURN"))
+		}
+		rs.AddToAppend(NewIPv4Rule("nat", "KILO-NAT", "-m", "comment", "--comment", "Kilo: NAT remaining packets", "-j", "MASQUERADE"))
+		return rs
+	}
+
+	v4.calls = 0
+	set200 := buildNatSet(200)
+	if err := controller.Set(set200); err != nil {
+		t.Fatalf("Set(200 nodes) failed: %v", err)
+	}
+	// Expect 1 List(POSTROUTING) + 1 RestoreNoFlush = 2 calls, instead of >800 per-rule calls.
+	if v4.calls > 2 {
+		t.Fatalf("expected <= 2 iptables invocations for 400+ KILO-NAT rules, got %d", v4.calls)
+	}
+
+	// Idempotent Set must do 0 client calls.
+	v4.calls = 0
+	if err := controller.Set(set200); err != nil {
+		t.Fatalf("idempotent Set(200 nodes) failed: %v", err)
+	}
+	if v4.calls != 0 {
+		t.Fatalf("expected 0 calls on unchanged RuleSet, got %d", v4.calls)
+	}
+
+	// Scaling from 200 to 205 nodes should rebuild KILO-NAT in a single RestoreNoFlush call (POSTROUTING unchanged).
+	v4.calls = 0
+	set205 := buildNatSet(205)
+	if err := controller.Set(set205); err != nil {
+		t.Fatalf("Set(205 nodes) failed: %v", err)
+	}
+	if v4.calls != 1 {
+		t.Fatalf("expected exactly 1 RestoreNoFlush call when updating KILO-NAT, got %d", v4.calls)
+	}
+
+	// External POSTROUTING rule must still be intact.
+	foundExternal := false
+	for _, r := range v4.storage {
+		if r.String() == externalRule.String() {
+			foundExternal = true
+			break
+		}
+	}
+	if !foundExternal {
+		t.Fatalf("external POSTROUTING rule was lost during KILO-NAT RestoreNoFlush")
+	}
+
+	// CleanUp must remove KILO-NAT chain and Kilo's POSTROUTING jump while keeping external POSTROUTING rule.
+	if err := controller.CleanUp(); err != nil {
+		t.Fatalf("CleanUp failed: %v", err)
+	}
+	if len(v4.storage) != 1 || v4.storage[0].String() != externalRule.String() {
+		t.Fatalf("expected only external rule after CleanUp, got %v", v4.storage)
+	}
+}
+
+func TestLiveRestoreClient(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live iptables-restore test requires linux")
+	}
+	if _, err := exec.LookPath("iptables-restore"); err != nil {
+		t.Skip("iptables-restore binary not installed")
+	}
+	if err := exec.Command("iptables", "-t", "nat", "-S").Run(); err != nil {
+		t.Skipf("insufficient privileges for live iptables test: %v", err)
+	}
+
+	c, err := New(WithClients(nil, &fakeClient{}))
+	if err != nil {
+		t.Fatalf("New controller failed: %v", err)
+	}
+	defer func() { _ = c.CleanUp() }()
+
+	rs := RuleSet{}
+	rs.AddToAppend(NewIPv4Chain("nat", "KILO-TEST-NAT"))
+	rs.AddToPrepend(NewIPv4Rule("nat", "POSTROUTING", "!", "-s", "192.168.102.0/23", "-d", "192.168.102.0/23", "-m", "comment", "--comment", "Kilo: jump to NAT chain", "-j", "KILO-TEST-NAT"))
+	rs.AddToPrepend(NewIPv4Rule("nat", "KILO-TEST-NAT", "-d", "100.66.0.1/32", "-m", "comment", "--comment", "Kilo: do not NAT packets destined for WireGuared IPs", "-j", "RETURN"))
+	rs.AddToAppend(NewIPv4Rule("nat", "KILO-TEST-NAT", "-m", "comment", "--comment", "Kilo: NAT remaining packets", "-j", "MASQUERADE"))
+
+	if err := c.Set(rs); err != nil {
+		t.Fatalf("live Set failed: %v", err)
+	}
+	if err := c.reconcile(); err != nil {
+		t.Fatalf("live reconcile failed: %v", err)
+	}
+	out, err := exec.Command("iptables", "-t", "nat", "-S", "KILO-TEST-NAT").CombinedOutput()
+	if err != nil {
+		t.Fatalf("listing KILO-TEST-NAT failed: %v (%s)", err, string(out))
+	}
+	if !strings.Contains(string(out), "100.66.0.1/32") || !strings.Contains(string(out), "MASQUERADE") {
+		t.Fatalf("unexpected KILO-TEST-NAT contents:\n%s", string(out))
+	}
+	if err := c.CleanUp(); err != nil {
+		t.Fatalf("live CleanUp failed: %v", err)
+	}
+	if err := exec.Command("iptables", "-t", "nat", "-S", "KILO-TEST-NAT").Run(); err == nil {
+		t.Fatalf("expected KILO-TEST-NAT chain to be deleted after CleanUp")
 	}
 }

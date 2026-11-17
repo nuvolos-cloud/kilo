@@ -122,3 +122,12 @@ func (m *metricsClientWrapper) ListChains(table string) ([]string, error) {
 	}).Inc()
 	return m.client.ListChains(table)
 }
+
+func (m *metricsClientWrapper) RestoreNoFlush(input string) error {
+	m.operationCounter.With(prometheus.Labels{
+		"operation": "RestoreNoFlush",
+		"table":     "*",
+		"chain":     "*",
+	}).Inc()
+	return m.client.RestoreNoFlush(input)
+}

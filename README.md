@@ -19,6 +19,29 @@ In addition to creating multi-cloud clusters, Kilo enables the creation of multi
 
 An introductory video about Kilo from KubeCon EU 2019 can be found on [youtube](https://www.youtube.com/watch?v=iPz_DAOOCKA).
 
+## Nuvolos Fork (`nuvolos-cloud/kilo`)
+
+This fork of [`squat/kilo`](https://github.com/squat/kilo) (with hybrid-cloud additions from [`cozystack/kilo`](https://github.com/cozystack/kilo)) includes features and large-cluster scaling fixes for hybrid bare-metal (Talos Linux) + cloud-bursting (Azure VMSS + Cilium VXLAN) Kubernetes clusters.
+
+Container images are published to [`ghcr.io/nuvolos-cloud/kilo`](https://github.com/orgs/nuvolos-cloud/packages/container/package/kilo).
+
+### Fork Changes Over Upstream
+
+#### Topology & Hybrid Dataplane
+- **`cross` mesh granularity (`--mesh-granularity=cross`):** Encrypts WireGuard traffic only between nodes in different `kilo.squat.ai/location` groups while leaving intra-location traffic on the native/CNI network (`cmd/kg`, `cmd/kgctl`, `pkg/mesh/topology.go`, `pkg/mesh/graph.go`, `docs/topology.md`).
+- **Cilium VXLAN / `cilium_tunl` compatibility (`--compatibility=cilium`):** Reuses Cilium's tunnel interface (falling back to `tunl0`), routes IPIP traffic over Cilium's VXLAN overlay (`kilo.squat.ai/cni-compatibility-ip`), and configures leader IPIP return paths when `--local=false` (`pkg/encapsulation/cilium.go`, `pkg/mesh/routes.go`).
+- **Underlay-derived WireGuard MTU (`--mtu=auto`):** Automatically detects the default underlay interface MTU and subtracts WireGuard overhead (`pkg/mesh/mesh.go`, `cmd/kg/main.go`).
+- **Internal IP CIDR filtering (`--internal-cidr`):** Restricts automatic private/internal node IP discovery to explicit CIDRs (`cmd/kg/main.go`, `pkg/mesh/discoverips.go`).
+- **Preferred source IP on WireGuard & tunnel routes:** Sets the node's internal IP as preferred `Src` on `kilo0` and encapsulated routes so cloud SDN fabrics (e.g., Azure) can route replies (`pkg/mesh/routes.go`).
+- **`allowed-location-ips` routing & NAT fixes:** Allows `kilo.squat.ai/allowed-location-ips` CIDRs that contain node private IPs (`pkg/mesh/topology.go`) and excludes traffic already originating inside an `allowed-location-ips` subnet (`! -s <cidr> -d <cidr>`) from jumping to `KILO-NAT` (`pkg/mesh/routes.go`).
+
+#### Large-Cluster Scaling & Stability (NC-4978)
+- **Sticky, coordination-free WireGuard IP allocation (`pkg/mesh/topology.go`, `pkg/mesh/mesh.go`, `cmd/kgctl`):** Preserves each segment leader's existing `kilo.squat.ai/wireguard-ip` across topology rebuilds and agent restarts before assigning lowest-free subnet IPs to new segments, preventing lexicographic hostname insertions/deletions (e.g., VMSS autoscaling) from renumbering existing nodes or churning peer `AllowedIPs`.
+- **Node watch event coalescing (`pkg/mesh/mesh.go`):** Debounces remote Kubernetes `Node` watch updates over a 1 s window (`nodeDebounce`) so autoscaling and annotation bursts trigger a single `applyTopology()` pass.
+- **Atomic batch `iptables` reconciliation (`pkg/iptables`, `pkg/mesh/routes.go`):** Replaces O(N) per-rule `iptables` fork/exec loops with atomic `iptables-restore --noflush` (`ip6tables-restore --noflush`) transactions—flushing/repopulating Kilo-owned chains (`KILO-NAT`, `KILO-IPIP`) in-place via `:CHAIN - [0:0]` while preserving external rules in shared chains and skipping `KILO-NAT` entirely when no `POSTROUTING` jump exists.
+- **Non-peer `DiscoveredEndpoints` churn filtering (`pkg/mesh/mesh.go`):** Ignores `kilo.squat.ai/discovered-endpoints` updates on remote nodes when the target peer has `PersistentKeepalive == 0`, shares the local node's `Location` in `cross` mode, or is already shadowed by a direct local WireGuard handshake.
+- **Extended node liveness check-in window (`pkg/mesh/backend.go`):** Raises `checkInPeriod` from 30 s to 5 m (10 m `Ready()` window) so API watch lag on 200+ node clusters cannot collapse the `Ready` set.
+
 ## How It Works
 
 Kilo uses [WireGuard](https://www.wireguard.com/), a performant and secure VPN, to create a mesh between the different nodes in a cluster.

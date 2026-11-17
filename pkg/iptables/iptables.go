@@ -15,10 +15,14 @@
 package iptables
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +96,7 @@ type Client interface {
 	DeleteChain(table string, chain string) error
 	NewChain(table string, chain string) error
 	ListChains(table string) ([]string, error)
+	RestoreNoFlush(input string) error
 }
 
 // Rule is an interface for interacting with iptables objects.
@@ -157,7 +162,14 @@ func (r *rule) String() string {
 	if r == nil {
 		return ""
 	}
-	spec := r.table + " -A " + r.chain
+	return r.table + " " + r.specString("-A")
+}
+
+func (r *rule) specString(op string) string {
+	if r == nil {
+		return ""
+	}
+	spec := op + " " + r.chain
 	for i, s := range r.spec {
 		spec += " "
 		// If this is the content of a comment, wrap the value in quotes.
@@ -247,6 +259,53 @@ func chainToString(table, chain string) string {
 	return fmt.Sprintf("%s -N %s", table, chain)
 }
 
+// restoreClient wraps a go-iptables client with atomic iptables-restore --noflush support.
+type restoreClient struct {
+	*iptables.IPTables
+	restorePath string
+	hasWait     bool
+}
+
+func newRestoreClient(proto iptables.Protocol) (Client, error) {
+	ipt, err := iptables.NewWithProtocol(proto)
+	if err != nil {
+		return nil, err
+	}
+	cmd := "iptables-restore"
+	if proto == iptables.ProtocolIPv6 {
+		cmd = "ip6tables-restore"
+	}
+	path, err := exec.LookPath(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find %s: %v", cmd, err)
+	}
+	v1, v2, v3 := ipt.GetIptablesVersion()
+	hasWait := v1 > 1 || (v1 == 1 && v2 > 6) || (v1 == 1 && v2 == 6 && v3 >= 2)
+	return &restoreClient{
+		IPTables:    ipt,
+		restorePath: path,
+		hasWait:     hasWait,
+	}, nil
+}
+
+func (r *restoreClient) RestoreNoFlush(input string) error {
+	if input == "" {
+		return nil
+	}
+	args := []string{"--noflush"}
+	if r.hasWait {
+		args = append(args, "--wait")
+	}
+	var stderr bytes.Buffer
+	cmd := exec.Command(r.restorePath, args...)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("running %s %s: %v: %s", r.restorePath, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // Controller is able to reconcile a given set of iptables rules.
 type Controller struct {
 	v4           Client
@@ -305,7 +364,7 @@ func New(opts ...ControllerOption) (*Controller, error) {
 		o(c)
 	}
 	if c.v4 == nil {
-		v4, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+		v4, err := newRestoreClient(iptables.ProtocolIPv4)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create iptables IPv4 client: %v", err)
 		}
@@ -320,7 +379,7 @@ func New(opts ...ControllerOption) (*Controller, error) {
 			_ = level.Info(c.logger).Log("msg", "IPv6 is disabled in the kernel; disabling the IPv6 iptables controller")
 			c.v6 = &fakeClient{}
 		} else {
-			v6, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+			v6, err := newRestoreClient(iptables.ProtocolIPv6)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create iptables IPv6 client: %v", err)
 			}
@@ -367,75 +426,143 @@ func (c *Controller) reconcile() error {
 	c.Lock()
 	defer c.Unlock()
 	var rc ruleCache
-	if err := c.reconcileAppendRules(rc); err != nil {
-		return err
+	for _, proto := range []Protocol{ProtocolIPv4, ProtocolIPv6} {
+		if err := c.reconcileProto(proto, &rc); err != nil {
+			return err
+		}
 	}
-	return c.reconcilePrependRules(rc)
+	return nil
 }
 
-func (c *Controller) reconcileAppendRules(rc ruleCache) error {
+func (c *Controller) reconcileProto(proto Protocol, rc *ruleCache) error {
+	owned := ownedChainsForProto(proto, c.appendRules, c.prependRules)
+
+	firstMissingAppend := -1
+	var missingAppendTables map[string]struct{}
 	for i, r := range c.appendRules {
-		ok, err := rc.exists(c.client(r.Proto()), r)
+		if r.Proto() != proto {
+			continue
+		}
+		ok, err := rc.exists(c.client(proto), r)
 		if err != nil {
 			return fmt.Errorf("failed to check if rule exists: %v", err)
 		}
 		if !ok {
-			_ = level.Info(c.logger).Log("msg", fmt.Sprintf("applying %d iptables rules", len(c.appendRules)-i))
-			if err := c.resetFromIndex(i, c.appendRules); err != nil {
-				return fmt.Errorf("failed to add rule: %v", err)
+			if firstMissingAppend == -1 {
+				firstMissingAppend = i
+				missingAppendTables = make(map[string]struct{})
 			}
-			break
+		}
+		if firstMissingAppend != -1 {
+			missingAppendTables[ruleTable(r)] = struct{}{}
 		}
 	}
-	return nil
-}
 
-func (c *Controller) reconcilePrependRules(rc ruleCache) error {
+	rebuildTables := make(map[string]struct{})
+	for t := range missingAppendTables {
+		if len(owned[t]) > 0 {
+			rebuildTables[t] = struct{}{}
+		}
+	}
+
+	var missingPrepends []*rule
 	for _, r := range c.prependRules {
-		ok, err := rc.exists(c.client(r.Proto()), r)
+		if r.Proto() != proto {
+			continue
+		}
+		ok, err := rc.exists(c.client(proto), r)
 		if err != nil {
 			return fmt.Errorf("failed to check if rule exists: %v", err)
 		}
 		if !ok {
-			_ = level.Info(c.logger).Log("msg", "prepending iptables rule")
-			if err := r.Prepend(c.client(r.Proto())); err != nil {
-				return fmt.Errorf("failed to prepend rule: %v", err)
+			ru, isRule := r.(*rule)
+			if !isRule {
+				continue
+			}
+			if owned[ru.table][ru.chain] {
+				rebuildTables[ru.table] = struct{}{}
+			} else {
+				missingPrepends = append(missingPrepends, ru)
 			}
 		}
 	}
-	return nil
-}
 
-// resetFromIndex re-adds all rules starting from the given index.
-func (c *Controller) resetFromIndex(i int, rules []Rule) error {
-	if i >= len(rules) {
+	if firstMissingAppend == -1 && len(rebuildTables) == 0 && len(missingPrepends) == 0 {
 		return nil
 	}
-	for j := i; j < len(rules); j++ {
-		if err := rules[j].Delete(c.client(rules[j].Proto())); err != nil {
-			return fmt.Errorf("failed to delete rule: %v", err)
-		}
-		if err := rules[j].Append(c.client(rules[j].Proto())); err != nil {
-			return fmt.Errorf("failed to add rule: %v", err)
-		}
-	}
-	return nil
-}
 
-// deleteFromIndex deletes all rules starting from the given index.
-func (c *Controller) deleteFromIndex(i int, rules *[]Rule) error {
-	if i >= len(*rules) {
-		return nil
-	}
-	for j := i; j < len(*rules); j++ {
-		if err := (*rules)[j].Delete(c.client((*rules)[j].Proto())); err != nil {
-			*rules = append((*rules)[:i], (*rules)[j:]...)
-			return fmt.Errorf("failed to delete rule: %v", err)
+	tables := make(map[string]*tableBatch)
+	getBatch := func(table string) *tableBatch {
+		b, ok := tables[table]
+		if !ok {
+			b = &tableBatch{flushedChains: make(map[string]bool)}
+			tables[table] = b
 		}
-		(*rules)[j] = nil
+		return b
 	}
-	*rules = (*rules)[:i]
-	return nil
+
+	// Atomically rebuild owned chains in affected tables via :CHAIN - [0:0].
+	for table := range rebuildTables {
+		b := getBatch(table)
+		for ch := range owned[table] {
+			b.flushedChains[ch] = true
+		}
+		for _, r := range c.prependRules {
+			if r.Proto() != proto {
+				continue
+			}
+			if ru, ok := r.(*rule); ok && ru.table == table && owned[table][ru.chain] {
+				b.lines = append(b.lines, insertSpecString(ru, 1))
+			}
+		}
+		for _, r := range c.appendRules {
+			if r.Proto() != proto {
+				continue
+			}
+			if ru, ok := r.(*rule); ok && ru.table == table && owned[table][ru.chain] {
+				b.lines = append(b.lines, ru.specString("-A"))
+			}
+		}
+	}
+
+	// Re-prepend missing rules on non-owned chains (e.g. POSTROUTING, FORWARD).
+	for _, ru := range missingPrepends {
+		b := getBatch(ru.table)
+		b.lines = append(b.lines, insertSpecString(ru, 1))
+	}
+
+	// Re-apply missing append rules from firstMissingAppend on non-owned chains (e.g. INPUT).
+	if firstMissingAppend != -1 {
+		_ = level.Info(c.logger).Log("msg", fmt.Sprintf("applying %d iptables rules", len(c.appendRules)-firstMissingAppend))
+		for j := firstMissingAppend; j < len(c.appendRules); j++ {
+			r := c.appendRules[j]
+			if r.Proto() != proto {
+				continue
+			}
+			if ch, ok := r.(*chain); ok {
+				if _, rebuilt := rebuildTables[ch.table]; !rebuilt {
+					b := getBatch(ch.table)
+					b.flushedChains[ch.chain] = true
+				}
+				continue
+			}
+			ru := r.(*rule)
+			if owned[ru.table][ru.chain] {
+				continue
+			}
+			exists, err := rc.exists(c.client(proto), ru)
+			if err != nil {
+				return fmt.Errorf("failed to check if rule exists: %v", err)
+			}
+			b := getBatch(ru.table)
+			if exists {
+				b.lines = append(b.lines, ru.specString("-D"))
+			}
+			b.lines = append(b.lines, ru.specString("-A"))
+		}
+	}
+
+	return c.restoreTables(proto, tables)
 }
 
 // Set idempotently overwrites any iptables rules previously defined
@@ -443,64 +570,354 @@ func (c *Controller) deleteFromIndex(i int, rules *[]Rule) error {
 func (c *Controller) Set(rules RuleSet) error {
 	c.Lock()
 	defer c.Unlock()
-	if err := c.setAppendRules(rules.appendRules); err != nil {
-		return err
+	if rulesEqual(c.appendRules, rules.appendRules) && rulesEqualUnordered(c.prependRules, rules.prependRules) {
+		return nil
 	}
-	return c.setPrependRules(rules.prependRules)
+	for _, proto := range []Protocol{ProtocolIPv4, ProtocolIPv6} {
+		if err := c.setProto(proto, rules.appendRules, rules.prependRules); err != nil {
+			return err
+		}
+	}
+	c.appendRules = append([]Rule(nil), rules.appendRules...)
+	c.prependRules = append([]Rule(nil), rules.prependRules...)
+	return nil
 }
 
-func (c *Controller) setAppendRules(appendRules []Rule) error {
-	var i int
-	for ; i < len(appendRules); i++ {
-		if i < len(c.appendRules) {
-			if appendRules[i].String() != c.appendRules[i].String() {
-				if err := c.deleteFromIndex(i, &c.appendRules); err != nil {
-					return err
+func (c *Controller) setProto(proto Protocol, newAppendAll, newPrependAll []Rule) error {
+	oldAppend := filterByProto(proto, c.appendRules)
+	newAppend := filterByProto(proto, newAppendAll)
+	oldPrepend := filterByProto(proto, c.prependRules)
+	newPrepend := filterByProto(proto, newPrependAll)
+
+	if rulesEqual(oldAppend, newAppend) && rulesEqualUnordered(oldPrepend, newPrepend) {
+		return nil
+	}
+
+	var rc ruleCache
+	oldOwned := ownedChainsForProto(proto, oldAppend, oldPrepend)
+	newOwned := ownedChainsForProto(proto, newAppend, newPrepend)
+
+	tables := make(map[string]*tableBatch)
+	getBatch := func(table string) *tableBatch {
+		b, ok := tables[table]
+		if !ok {
+			b = &tableBatch{
+				flushedChains: make(map[string]bool),
+				deletedChains: make(map[string]bool),
+			}
+			tables[table] = b
+		}
+		return b
+	}
+
+	// Determine which owned chains changed and need atomic flush + repopulate.
+	for table, chains := range newOwned {
+		for ch := range chains {
+			if !oldOwned[table][ch] ||
+				!chainRulesEqual(table, ch, oldAppend, newAppend) ||
+				!chainRulesEqualUnordered(table, ch, oldPrepend, newPrepend) {
+				b := getBatch(table)
+				b.flushedChains[ch] = true
+				for _, r := range newPrepend {
+					if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+						b.lines = append(b.lines, insertSpecString(ru, 1))
+					}
+				}
+				for _, r := range newAppend {
+					if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+						b.lines = append(b.lines, ru.specString("-A"))
+					}
 				}
 			}
 		}
-		if i >= len(c.appendRules) {
-			if err := appendRules[i].Append(c.client(appendRules[i].Proto())); err != nil {
-				return fmt.Errorf("failed to add rule: %v", err)
+	}
+
+	// Handle non-owned append rules (e.g. INPUT jumps).
+	oldNonOwnedAppend := filterNonOwnedRules(oldAppend, oldOwned)
+	newNonOwnedAppend := filterNonOwnedRules(newAppend, newOwned)
+	if !rulesEqual(oldNonOwnedAppend, newNonOwnedAppend) {
+		diverge := 0
+		for diverge < len(oldNonOwnedAppend) && diverge < len(newNonOwnedAppend) &&
+			oldNonOwnedAppend[diverge].String() == newNonOwnedAppend[diverge].String() {
+			diverge++
+		}
+		for j := diverge; j < len(oldNonOwnedAppend); j++ {
+			ru := oldNonOwnedAppend[j].(*rule)
+			exists, err := rc.exists(c.client(proto), ru)
+			if err != nil {
+				return fmt.Errorf("failed to check if rule exists: %v", err)
 			}
-			c.appendRules = append(c.appendRules, appendRules[i])
+			if exists {
+				getBatch(ru.table).lines = append(getBatch(ru.table).lines, ru.specString("-D"))
+			}
+		}
+		for j := diverge; j < len(newNonOwnedAppend); j++ {
+			ru := newNonOwnedAppend[j].(*rule)
+			exists, err := rc.exists(c.client(proto), ru)
+			if err != nil {
+				return fmt.Errorf("failed to check if rule exists: %v", err)
+			}
+			// Avoid duplicate if rule already exists in kernel and wasn't scheduled for deletion above.
+			deletedAbove := false
+			for k := diverge; k < len(oldNonOwnedAppend); k++ {
+				if oldNonOwnedAppend[k].String() == ru.String() {
+					deletedAbove = true
+					break
+				}
+			}
+			if !exists || deletedAbove {
+				getBatch(ru.table).lines = append(getBatch(ru.table).lines, ru.specString("-A"))
+			}
 		}
 	}
-	err := c.deleteFromIndex(i, &c.appendRules)
-	if err != nil {
-		return fmt.Errorf("failed to delete rule: %v", err)
+
+	// Handle non-owned prepend rules (e.g. POSTROUTING jumps, FORWARD rules):
+	// add new ones first, then delete obsolete ones before deleting any owned chains they referenced.
+	for _, r := range newPrepend {
+		ru, ok := r.(*rule)
+		if !ok || newOwned[ru.table][ru.chain] {
+			continue
+		}
+		if !containsRule(oldPrepend, r) {
+			exists, err := rc.exists(c.client(proto), ru)
+			if err != nil {
+				return fmt.Errorf("failed to check if rule exists: %v", err)
+			}
+			if !exists {
+				getBatch(ru.table).lines = append(getBatch(ru.table).lines, insertSpecString(ru, 1))
+			}
+		}
+	}
+	for _, r := range oldPrepend {
+		ru, ok := r.(*rule)
+		if !ok || oldOwned[ru.table][ru.chain] || newOwned[ru.table][ru.chain] {
+			continue
+		}
+		if !containsRule(newPrepend, r) {
+			exists, err := rc.exists(c.client(proto), ru)
+			if err != nil {
+				return fmt.Errorf("failed to check if rule exists: %v", err)
+			}
+			if exists {
+				getBatch(ru.table).lines = append(getBatch(ru.table).lines, ru.specString("-D"))
+			}
+		}
+	}
+
+	// Delete owned chains that are no longer desired (after jump rules in that table were removed).
+	for table, chains := range oldOwned {
+		for ch := range chains {
+			if !newOwned[table][ch] {
+				chainRule := &chain{table: table, chain: ch, proto: proto}
+				exists, err := rc.exists(c.client(proto), chainRule)
+				if err != nil {
+					return fmt.Errorf("failed to check if chain exists: %v", err)
+				}
+				if exists {
+					b := getBatch(table)
+					b.deletedChains[ch] = true
+				}
+			}
+		}
+	}
+
+	return c.restoreTables(proto, tables)
+}
+
+type tableBatch struct {
+	flushedChains map[string]bool
+	deletedChains map[string]bool
+	lines         []string
+}
+
+func (c *Controller) restoreTables(proto Protocol, tables map[string]*tableBatch) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	tableNames := make([]string, 0, len(tables))
+	for t := range tables {
+		tableNames = append(tableNames, t)
+	}
+	sort.Strings(tableNames)
+
+	var buf strings.Builder
+	for _, table := range tableNames {
+		b := tables[table]
+		if len(b.flushedChains) == 0 && len(b.deletedChains) == 0 && len(b.lines) == 0 {
+			continue
+		}
+		buf.WriteByte('*')
+		buf.WriteString(table)
+		buf.WriteByte('\n')
+
+		if len(b.flushedChains) > 0 {
+			chains := make([]string, 0, len(b.flushedChains))
+			for ch := range b.flushedChains {
+				chains = append(chains, ch)
+			}
+			sort.Strings(chains)
+			for _, ch := range chains {
+				buf.WriteByte(':')
+				buf.WriteString(ch)
+				buf.WriteString(" - [0:0]\n")
+			}
+		}
+		for _, line := range b.lines {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+		}
+		if len(b.deletedChains) > 0 {
+			chains := make([]string, 0, len(b.deletedChains))
+			for ch := range b.deletedChains {
+				chains = append(chains, ch)
+			}
+			sort.Strings(chains)
+			for _, ch := range chains {
+				buf.WriteString("-F ")
+				buf.WriteString(ch)
+				buf.WriteByte('\n')
+				buf.WriteString("-X ")
+				buf.WriteString(ch)
+				buf.WriteByte('\n')
+			}
+		}
+		buf.WriteString("COMMIT\n")
+	}
+	payload := buf.String()
+	if payload == "" {
+		return nil
+	}
+	if err := c.client(proto).RestoreNoFlush(payload); err != nil {
+		return fmt.Errorf("failed to restore iptables rules: %v", err)
 	}
 	return nil
 }
 
-func (c *Controller) setPrependRules(prependRules []Rule) error {
-	for _, prependRule := range prependRules {
-		if !containsRule(c.prependRules, prependRule) {
-			if err := prependRule.Prepend(c.client(prependRule.Proto())); err != nil {
-				return fmt.Errorf("failed to add rule: %v", err)
-			}
-			c.prependRules = append(c.prependRules, prependRule)
+func insertSpecString(r *rule, pos int) string {
+	spec := fmt.Sprintf("-I %s %d", r.chain, pos)
+	for i, s := range r.spec {
+		spec += " "
+		if i > 0 && r.spec[i-1] == "--comment" {
+			spec += `"` + s + `"`
+		} else {
+			spec += s
 		}
 	}
-	for _, existingRule := range c.prependRules {
-		if !containsRule(prependRules, existingRule) {
-			if err := existingRule.Delete(c.client(existingRule.Proto())); err != nil {
-				return fmt.Errorf("failed to delete rule: %v", err)
-			}
-			c.prependRules = removeRule(c.prependRules, existingRule)
-		}
-	}
-	return nil
+	return spec
 }
 
-func removeRule(rules []Rule, toRemove Rule) []Rule {
-	ret := make([]Rule, 0, len(rules))
-	for _, rule := range rules {
-		if rule.String() != toRemove.String() {
-			ret = append(ret, rule)
+func ruleTable(r Rule) string {
+	switch v := r.(type) {
+	case *chain:
+		return v.table
+	case *rule:
+		return v.table
+	default:
+		return ""
+	}
+}
+
+func filterByProto(proto Protocol, rules []Rule) []Rule {
+	var out []Rule
+	for _, r := range rules {
+		if r.Proto() == proto {
+			out = append(out, r)
 		}
 	}
-	return ret
+	return out
+}
+
+func ownedChainsForProto(proto Protocol, ruleSets ...[]Rule) map[string]map[string]bool {
+	owned := make(map[string]map[string]bool)
+	for _, rs := range ruleSets {
+		for _, r := range rs {
+			if r.Proto() != proto {
+				continue
+			}
+			if ch, ok := r.(*chain); ok {
+				if owned[ch.table] == nil {
+					owned[ch.table] = make(map[string]bool)
+				}
+				owned[ch.table][ch.chain] = true
+			}
+		}
+	}
+	return owned
+}
+
+func filterNonOwnedRules(rules []Rule, owned map[string]map[string]bool) []Rule {
+	var out []Rule
+	for _, r := range rules {
+		ru, ok := r.(*rule)
+		if !ok {
+			continue
+		}
+		if owned[ru.table][ru.chain] {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func rulesEqual(a, b []Rule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Proto() != b[i].Proto() || a[i].String() != b[i].String() {
+			return false
+		}
+	}
+	return true
+}
+
+func rulesEqualUnordered(a, b []Rule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, r := range a {
+		counts[fmt.Sprintf("%d:%s", r.Proto(), r.String())]++
+	}
+	for _, r := range b {
+		k := fmt.Sprintf("%d:%s", r.Proto(), r.String())
+		counts[k]--
+		if counts[k] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func chainRulesEqual(table, ch string, a, b []Rule) bool {
+	var ra, rb []Rule
+	for _, r := range a {
+		if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+			ra = append(ra, r)
+		}
+	}
+	for _, r := range b {
+		if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+			rb = append(rb, r)
+		}
+	}
+	return rulesEqual(ra, rb)
+}
+
+func chainRulesEqualUnordered(table, ch string, a, b []Rule) bool {
+	var ra, rb []Rule
+	for _, r := range a {
+		if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+			ra = append(ra, r)
+		}
+	}
+	for _, r := range b {
+		if ru, ok := r.(*rule); ok && ru.table == table && ru.chain == ch {
+			rb = append(rb, r)
+		}
+	}
+	return rulesEqualUnordered(ra, rb)
 }
 
 func containsRule(haystack []Rule, needle Rule) bool {
@@ -514,13 +931,7 @@ func containsRule(haystack []Rule, needle Rule) bool {
 
 // CleanUp will clean up any rules created by the controller.
 func (c *Controller) CleanUp() error {
-	c.Lock()
-	defer c.Unlock()
-	err := c.deleteFromIndex(0, &c.prependRules)
-	if err != nil {
-		return err
-	}
-	return c.deleteFromIndex(0, &c.appendRules)
+	return c.Set(RuleSet{})
 }
 
 func (c *Controller) client(p Protocol) Client {

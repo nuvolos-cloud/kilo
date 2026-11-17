@@ -16,9 +16,9 @@ package main
 
 import (
 	"fmt"
-
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"net"
 
 	"github.com/squat/kilo/pkg/mesh"
 )
@@ -54,10 +54,10 @@ func runGraph(_ *cobra.Command, _ []string) error {
 			hostname = n.Name
 		}
 		if n.WireGuardIP != nil {
-			subnet = n.WireGuardIP
+			subnet = &net.IPNet{IP: n.WireGuardIP.IP.Mask(n.WireGuardIP.Mask), Mask: n.WireGuardIP.Mask}
 		}
 	}
-	subnet.IP = subnet.IP.Mask(subnet.Mask)
+	subnet = &net.IPNet{IP: subnet.IP.Mask(subnet.Mask), Mask: subnet.Mask}
 	if len(nodes) == 0 {
 		return fmt.Errorf("did not find any valid Kilo nodes in the cluster")
 	}
